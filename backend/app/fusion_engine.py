@@ -29,6 +29,7 @@ from app.models import (
     WatermarkRecord,
     WideTableDef,
 )
+from app.quarantine import QuarantineManager
 
 
 def _now_iso() -> str:
@@ -60,6 +61,9 @@ class FusionEngine:
         self._cross_validates: dict[int, CrossValidatePlan] = {}
         self._drifts: dict[int, DataDriftRecord] = {}
         self._monitors: dict[int, FusionMonitorMetric] = {}
+        self._quarantine = QuarantineManager()
+        self._wide_rows: dict[str, list[dict[str, Any]]] = {}
+        self._row_key_fields: dict[str, str] = {}
         self._next_id: int = 1
 
     def _next_seq(self) -> int:
@@ -416,6 +420,8 @@ class FusionEngine:
         quality_result = self._apply_quality_gates(
             conflict_result.get("resolved", mapped_records),
             job.target_wide_table,
+            row_key_field=job.join_key,
+            release_version=job.job_code,
         )
         result["quality_gate"] = quality_result
 
@@ -743,6 +749,172 @@ class FusionEngine:
             "group_dimensions": group_dimensions,
         }
 
+    # ---- 9. quality_gate -> 隔离视图 -> 补写清单 -> backfill_task 续办 ----
+
+    def run_quality_gate(self, target_wide_table: str,
+                         records: list[dict[str, Any]] | None = None,
+                         *,
+                         row_key_field: str = "订单号",
+                         release_version: str = "") -> dict[str, Any]:
+        """对宽表当前数据跑质量门禁，违规行写入隔离视图。
+
+        records 为空时检查已登记的宽表当前数据（更正与补写生效后的最新行）。
+        """
+        if records is not None:
+            self._wide_rows[target_wide_table] = records
+            self._row_key_fields[target_wide_table] = row_key_field
+        current = self._wide_rows.get(target_wide_table)
+        if current is None:
+            return {"ok": False, "message": f"宽表 {target_wide_table} 没有可检查的数据"}
+        result = self._apply_quality_gates(
+            current,
+            target_wide_table,
+            row_key_field=self._row_key_fields.get(target_wide_table, row_key_field),
+            release_version=release_version,
+        )
+        result["ok"] = True
+        return result
+
+    def wide_table_rows(self, target_wide_table: str) -> list[dict[str, Any]]:
+        """读取宽表当前数据（更正回执与隔离补写生效后的最新行）。"""
+        return [dict(rec) for rec in self._wide_rows.get(target_wide_table, [])]
+
+    def quarantine_view(self, target_wide_table: str | None = None,
+                        *,
+                        row_key: str | None = None,
+                        field: str | None = None,
+                        reason: str | None = None,
+                        status: str | None = None) -> list[dict[str, Any]]:
+        """隔离视图：按订单、字段或错误原因过滤，读取当时的数据与后到的更正。"""
+        return self._quarantine.view(
+            target_wide_table=target_wide_table,
+            row_key=row_key, field=field, reason=reason, status=status,
+        )
+
+    def review_quarantine_entry(self, entry_id: int, note: str = "") -> dict[str, Any]:
+        """复核隔离行：确认异常无需补写后核清。"""
+        entry = self._quarantine.review(entry_id, note)
+        if entry is None:
+            return {"ok": False, "message": f"隔离行 {entry_id} 不存在或已归档"}
+        return {"ok": True, "message": f"隔离行 {entry.quarantine_code} 已核清",
+                "entry": entry.to_view()}
+
+    def receive_quarantine_correction(self, entry_id: int, value: Any,
+                                      receipt_code: str = "") -> dict[str, Any]:
+        """登记更正回执（可能迟到）：先保留在隔离行上，确认后才生效。"""
+        receipt = self._quarantine.receive_correction(entry_id, value, receipt_code)
+        if receipt is None:
+            return {"ok": False, "message": f"隔离行 {entry_id} 不存在或已归档"}
+        return {"ok": True, "receipt_code": receipt.receipt_code,
+                "message": f"更正回执 {receipt.receipt_code} 已登记，待确认"}
+
+    def confirm_quarantine_correction(self, entry_id: int,
+                                      receipt_id: int | None = None) -> dict[str, Any]:
+        """确认更正回执：新值写入宽表行并记快照修正明细。"""
+        effect = self._quarantine.confirm_correction(entry_id, receipt_id)
+        if effect is None:
+            return {"ok": False,
+                    "message": f"隔离行 {entry_id} 不存在或没有可确认的更正回执"}
+        self._apply_correction_effect(effect)
+        return {"ok": True,
+                "message": f"{effect['row_key']} 的 {effect['field']} 已确认更正",
+                "effect": effect}
+
+    def build_quarantine_backfill_list(self, entry_ids: list[int]) -> dict[str, Any]:
+        """按值班选择生成隔离行补写清单：同一订单命中多个检查只补成一行。"""
+        qlist = self._quarantine.build_backfill_list(entry_ids)
+        return {
+            "ok": True,
+            "list_id": qlist.list_id,
+            "list_code": qlist.list_code,
+            "target_wide_table": qlist.target_wide_table,
+            "items": [
+                {"row_key": item.row_key, "status": item.status,
+                 "fields": [{"field": bf.field, "entry_id": bf.entry_id,
+                             "reason": bf.reason, "proposed_value": bf.proposed_value,
+                             "status": bf.status} for bf in item.fields]}
+                for item in qlist.items
+            ],
+        }
+
+    def submit_quarantine_backfill(self, list_id: int) -> dict[str, Any]:
+        """提交补写：执行仍有效的项，返回仍可执行的对象与待核原因。"""
+        result = self._quarantine.submit_backfill(list_id)
+        if result is None:
+            return {"ok": False, "message": f"补写清单 {list_id} 不存在"}
+        for effect in result["applied"]:
+            self._apply_correction_effect(effect)
+        return result
+
+    def claim_backfill_continuation(self, backfill_id: int, list_id: int) -> dict[str, Any]:
+        """分区回填续办：关联隔离行补写清单，从中领取待补订单及字段。"""
+        task = self._backfills.get(backfill_id)
+        if task is None:
+            return {"ok": False, "message": f"回填任务 {backfill_id} 不存在"}
+        result = self._quarantine.claim_continuation(list_id, task.task_code)
+        if result is None:
+            return {"ok": False, "message": f"补写清单 {list_id} 不存在"}
+        task.quarantine_list_code = result["list_code"]
+        result["task_code"] = task.task_code
+        return result
+
+    def apply_quarantine_backfill(self, list_id: int, row_key: str,
+                                  values: dict[str, Any]) -> dict[str, Any]:
+        """对续办领取的待补字段执行补写，写入宽表行并记快照修正明细。"""
+        result = self._quarantine.apply_backfill(list_id, row_key, values)
+        if result is None:
+            return {"ok": False, "message": f"补写清单 {list_id} 不存在"}
+        for effect in result.get("applied", []):
+            self._apply_correction_effect(effect)
+        return result
+
+    def snapshot_correction_details(self, partition_id: int) -> list[dict[str, Any]]:
+        """读取分区快照的修正明细：同一订单只保留一条。"""
+        snap = self._snapshots.get(partition_id)
+        return [dict(detail) for detail in snap.correction_details] if snap else []
+
+    def _apply_correction_effect(self, effect: dict[str, Any]) -> None:
+        """把确认后的更正/补写生效到宽表当前行，并记快照修正明细。"""
+        table = effect["target_wide_table"]
+        key_field = self._row_key_fields.get(table, "订单号")
+        old_value = None
+        for rec in self._wide_rows.get(table, []):
+            if str(rec.get(key_field, rec.get("id", ""))) == effect["row_key"]:
+                old_value = rec.get(effect["field"])
+                rec[effect["field"]] = effect["value"]
+        self._record_snapshot_correction(
+            table, effect["row_key"], effect["field"],
+            old_value, effect["value"], effect["source"],
+        )
+
+    def _record_snapshot_correction(self, table: str, row_key: str, field_name: str,
+                                    old_value: Any, new_value: Any, source: str) -> None:
+        """在宽表最新快照上记修正明细；同一订单只保留一条，字段逐条并入。"""
+        snap: SnapshotPartition | None = None
+        for candidate in self._snapshots.values():
+            if candidate.target_wide_table == table:
+                if snap is None or candidate.partition_id > snap.partition_id:
+                    snap = candidate
+        if snap is None:
+            snap = self.create_snapshot(
+                table,
+                partition_key_value=datetime.now(timezone.utc).strftime("%Y%m%d"),
+            )
+        detail = next(
+            (d for d in snap.correction_details if d["row_key"] == row_key),
+            None,
+        )
+        if detail is None:
+            detail = {"row_key": row_key, "fields": [], "updates": [], "updated_at": ""}
+            snap.correction_details.append(detail)
+        if field_name not in detail["fields"]:
+            detail["fields"].append(field_name)
+        detail["updates"].append({
+            "field": field_name, "old": old_value, "new": new_value,
+            "source": source, "at": _now_iso(),
+        })
+        detail["updated_at"] = _now_iso()
+
     # ---- 辅助方法 ----
 
     def _find_source_by_code(self, source_code: str) -> SourceDef | None:
@@ -823,32 +995,63 @@ class FusionEngine:
         }
 
     def _apply_quality_gates(self, records: list[dict[str, Any]],
-                             target_wide_table: str) -> dict[str, Any]:
-        """应用质量门禁检查。"""
+                             target_wide_table: str,
+                             *,
+                             row_key_field: str = "id",
+                             release_version: str = "") -> dict[str, Any]:
+        """应用质量门禁检查：违规行写入隔离视图，不再只统计缺值数量。"""
         gates = [
             g for g in self._quality_gates.values()
             if g.target_wide_table == target_wide_table
         ]
         if not gates:
-            return {"passed": True, "gates_checked": 0, "violations": []}
+            return {"passed": True, "gates_checked": 0, "violations": [],
+                    "quarantine_entries": [], "suppressed": []}
 
         violations: list[dict[str, Any]] = []
+        quarantined: list[dict[str, Any]] = []
+        suppressed: list[dict[str, Any]] = []
         for gate in gates:
             gate.checked_rows = len(records)
             if gate.check_type == "row_count_min" and len(records) < int(gate.threshold_condition):
                 violations.append({"rule_code": gate.rule_code, "check": "row_count_min",
                                    "actual": len(records), "threshold": gate.threshold_condition})
             elif gate.check_type == "null_check":
-                null_count = sum(
-                    1 for rec in records
-                    if rec.get(gate.threshold_condition) is None
-                )
-                if null_count > 0:
+                field_name = gate.threshold_condition
+                bad_rows = [
+                    rec for rec in records
+                    if rec.get(field_name) is None or rec.get(field_name) == ""
+                ]
+                effective: list[dict[str, Any]] = []
+                for rec in bad_rows:
+                    row_key = str(rec.get(row_key_field, rec.get("id", "")))
+                    if self._quarantine.is_cleared(
+                            target_wide_table, row_key, field_name, "null_check"):
+                        suppressed.append({"rule_code": gate.rule_code,
+                                           "row_key": row_key, "field": field_name,
+                                           "reason": "异常已核清，门禁放行"})
+                    else:
+                        effective.append(rec)
+                if effective:
+                    gate.last_triggered = _now_iso()
                     violations.append({"rule_code": gate.rule_code, "check": "null_check",
-                                       "null_count": null_count})
+                                       "null_count": len(effective)})
+                    for rec in effective:
+                        entry = self._quarantine.record_violation(
+                            target_wide_table,
+                            row_key=str(rec.get(row_key_field, rec.get("id", ""))),
+                            field=field_name,
+                            check_type="null_check",
+                            reason=f"{field_name}缺值",
+                            data_snapshot=rec,
+                            original_version=release_version or gate.rule_code,
+                        )
+                        quarantined.append(entry.to_view())
 
         passed = len(violations) == 0
-        return {"passed": passed, "gates_checked": len(gates), "violations": violations}
+        return {"passed": passed, "gates_checked": len(gates),
+                "violations": violations, "quarantine_entries": quarantined,
+                "suppressed": suppressed}
 
     @staticmethod
     def _make_merge_key(record: dict[str, Any], join_key: str) -> str:
@@ -874,6 +1077,7 @@ class FusionEngine:
             "cross_validates": len(self._cross_validates),
             "drifts": len(self._drifts),
             "monitors": len(self._monitors),
+            "quarantine_entries": len(self._quarantine.entries),
         }
 
 

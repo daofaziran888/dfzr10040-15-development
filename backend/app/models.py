@@ -198,6 +198,7 @@ class SnapshotPartition:
     status_mark: str
     dependency_partitions: list[str]
     created_time: str
+    correction_details: list[dict[str, Any]] = field(default_factory=list)
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -224,6 +225,7 @@ class BackfillTask:
     checkpoint_position: str = ""
     processed_rows: int = 0
     remaining_rows: int = 0
+    quarantine_list_code: str = ""
 
 
 @dataclass
